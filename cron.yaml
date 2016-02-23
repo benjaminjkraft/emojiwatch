@@ -1,0 +1,4 @@
+cron:
+- description: emojiwatch
+  url: /watch
+  schedule: every 1 mins
