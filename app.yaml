@@ -11,4 +11,3 @@ libraries:
 handlers:
 - url: /.*
   script: emojiwatch.app
-  login: admin

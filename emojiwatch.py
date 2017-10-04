@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import logging
 import urllib
 import urllib2
 
@@ -8,43 +9,7 @@ import webapp2
 
 import secrets
 
-# The channel we post to
-CHANNEL_NAME = '#emojiwatch'
 _SLACK_API_URL = 'https://slack.com/api/'
-
-
-class EmojiList(ndb.Model):
-    """Singleton to store the current list of emoji."""
-    emoji = ndb.JsonProperty()
-
-
-def hit_slack_api(method, data=None):
-    if data is None:
-        data = {}
-    data['token'] = secrets.slack_bot_token
-    data['as_user'] = True
-    res = urllib2.urlopen(_SLACK_API_URL + method,
-                          data=urllib.urlencode(data))
-    decoded = json.loads(res.read())
-    if not decoded['ok']:
-        raise RuntimeError("not ok, slack said %s" % decoded)
-    return decoded
-
-
-def get_new_emoji():
-    return hit_slack_api('emoji.list')['emoji']
-
-
-def get_old_emoji():
-    emoji_list = EmojiList.get_by_id('()')
-    if not emoji_list:
-        return {}
-    else:
-        return emoji_list.emoji
-
-
-def save_emoji(emoji):
-    return EmojiList(id='()', emoji=emoji).put()
 
 
 def format_single_attachment(verb, name, value):
@@ -61,37 +26,89 @@ def format_single_attachment(verb, name, value):
         }
 
 
-def format_diff(old, new):
-    attachments = []
-    for name, value in new.iteritems():
-        if value != old.get(name):
-            attachments.append(
-                format_single_attachment("Added", name, value))
-    for name, value in old.iteritems():
-        if value != new.get(name):
-            attachments.append(
-                format_single_attachment("Removed", name, value))
-    return attachments
+class SlackTeam(ndb.Model):
+    """Stores the data we need for a particular team.
+
+    Keyed by Slack team ID.
+    """
+    access_token = ndb.StringProperty()
+    webhook = ndb.StringProperty()
+    emoji = ndb.JsonProperty()
+
+    def send_message(self, attachments):
+        res = urllib2.urlopen(urllib2.Request(
+            self.webhook,
+            json.dumps({'attachments': attachments}),
+            {'Content-Type': 'application/json'})).read()
+        if res.lower().strip() != 'ok':
+            raise RuntimeError("not ok, slack said %s" % res)
+
+    def fetch_emoji(self):
+        res = urllib2.urlopen(
+            _SLACK_API_URL + 'emoji.list',
+            # for some reason this doesn't support sending json
+            urllib.urlencode({'token': self.access_token}))
+        decoded = json.loads(res.read())
+        if not decoded['ok']:
+            raise RuntimeError("not ok, slack said %s" % decoded)
+        return decoded
+
+    def fill_emoji(self, bust_cache=False):
+        if bust_cache or not self.emoji:
+            self.emoji = self.fetch_emoji()['emoji']
+            self.put()
+
+    def handle_add(self, data):
+        self.fill_emoji()
+        self.emoji[data['name']] = data['value']
+        self.send_message([
+            format_single_attachment("Added", data['name'], data['value'])])
+        self.put()
+
+    def handle_remove(self, data):
+        self.fill_emoji()
+        self.send_message([
+            format_single_attachment("Removed", name,
+                                     self.emoji.pop(name, u'¯\_(ツ)_/¯'))
+            for name in data['names']])
+        self.put()
 
 
-def send_message(channel, attachments):
-    hit_slack_api('chat.postMessage', {
-        'channel': channel,
-        'attachments': json.dumps(attachments),
-        'unfurl_media': True})
+def handle_event(data):
+    event = data['event']
+    if event['type'] != 'emoji_changed':
+        logging.error('unhandled event type %s', event['type'])
+        return
+
+    team = SlackTeam.get_by_id(data['team_id'])
+    if not team:
+        logging.error('invalid team %s', data['team_id'])
+        return
+
+    if event['subtype'] == 'add':
+        team.handle_add(event)
+    elif event['subtype'] == 'remove':
+        team.handle_remove(event)
+    else:
+        logging.error('unhandled event subtype %s', event['subtype'])
 
 
-class Watch(webapp2.RequestHandler):
-    def get(self):
-        """Invoked by cron."""
-        old = get_old_emoji()
-        new = get_new_emoji()
-        diff = format_diff(old, new)
-        if diff:
-            send_message(CHANNEL_NAME, diff)
-        save_emoji(new)
+class EventHook(webapp2.RequestHandler):
+    def post(self):
+        data = json.loads(self.request.body)
+        logging.info(data)
+        if data['token'] != secrets.VERIFICATION_TOKEN:
+            logging.error('invalid token %s', data['token'])
+            self.response.status = 403
+            self.response.write('Invalid token')
+        elif data['type'] == 'url_verification':
+            self.response.write(data['challenge'])
+        elif data['type'] == 'event_callback':
+            handle_event(data)   # TODO(benkraft): defer this!
+        else:
+            logging.error('unhandled type %s', data['type'])
 
 
 app = webapp2.WSGIApplication([
-    ('/watch', Watch),
+    ('/event_hook', EventHook),
 ])
