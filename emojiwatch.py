@@ -9,6 +9,8 @@ import webapp2
 
 import secrets
 
+_SLACK_AUTHORIZE_URL = 'https://slack.com/oauth/authorize'
+_SLACK_SCOPES='incoming-webhook,emoji:read'
 _SLACK_API_URL = 'https://slack.com/api/'
 
 
@@ -24,6 +26,15 @@ def format_single_attachment(verb, name, value):
             "mrkdwn_in": ["text"],
             "text": "*%s*: `:%s:` (%s)" % (verb, name, value),
         }
+
+
+def hit_slack_api(method, data):
+    # most of the APIs don't support JSON...
+    res = urllib2.urlopen(_SLACK_API_URL + method, urllib.urlencode(data))
+    decoded = json.loads(res.read())
+    if not decoded['ok']:
+        raise RuntimeError("not ok, slack said %s" % decoded)
+    return decoded
 
 
 class SlackTeam(ndb.Model):
@@ -44,14 +55,7 @@ class SlackTeam(ndb.Model):
             raise RuntimeError("not ok, slack said %s" % res)
 
     def fetch_emoji(self):
-        res = urllib2.urlopen(
-            _SLACK_API_URL + 'emoji.list',
-            # for some reason this doesn't support sending json
-            urllib.urlencode({'token': self.access_token}))
-        decoded = json.loads(res.read())
-        if not decoded['ok']:
-            raise RuntimeError("not ok, slack said %s" % decoded)
-        return decoded
+        return hit_slack_api('emoji.list', {'token': self.access_token})
 
     def fill_emoji(self, bust_cache=False):
         if bust_cache or not self.emoji:
@@ -109,6 +113,30 @@ class EventHook(webapp2.RequestHandler):
             logging.error('unhandled type %s', data['type'])
 
 
+class OAuthRedirect(webapp2.RequestHandler):
+    def get(self):
+        res = hit_slack_api('oauth.access', {
+            'code': self.request.get('code'),
+            'client_id': secrets.CLIENT_ID,
+            'client_secret': secrets.CLIENT_SECRET,
+        })
+        logging.info(res)
+        team = SlackTeam(
+            id=res['team_id'],
+            access_token=res['access_token'],
+            webhook=res['incoming_webhook']['url'])
+        team.put()
+        self.response.write('ok')
+
+
+class Add(webapp2.RequestHandler):
+    def get(self):
+        return webapp2.redirect('%s?client_id=%s&scope=%s' % (
+            _SLACK_AUTHORIZE_URL, secrets.CLIENT_ID, _SLACK_SCOPES))
+
+
 app = webapp2.WSGIApplication([
     ('/event_hook', EventHook),
+    ('/oauth_redirect', OAuthRedirect),
+    ('/add', Add),
 ])
