@@ -135,8 +135,14 @@ class Add(webapp2.RequestHandler):
             _SLACK_AUTHORIZE_URL, secrets.CLIENT_ID, _SLACK_SCOPES))
 
 
+class Info(webapp2.RequestHandler):
+    def get(self):
+        return webapp2.redirect('https://github.com/khan/emojiwatch')
+
+
 app = webapp2.WSGIApplication([
     ('/event_hook', EventHook),
     ('/oauth_redirect', OAuthRedirect),
     ('/add', Add),
+    ('/.*', Info),
 ])
